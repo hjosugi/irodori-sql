@@ -1,0 +1,4 @@
+target/
+.irodori-local/
+.DS_Store
+*.log

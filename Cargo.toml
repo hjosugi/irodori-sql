@@ -1,11 +1,14 @@
 [package]
 name = "irodori-sql"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-publish = false
+version = "0.2.23"
+edition = "2021"
+license = "MIT OR 0BSD"
+authors = ["Irodori Table contributors"]
+description = "SQL dialect, parameter, metamodel, and schema helpers for Irodori."
+repository = "https://github.com/hjosugi/irodori-sql"
+readme = "README.md"
+keywords = ["sql", "database", "dialect", "schema"]
+categories = ["database"]
 
 [lib]
 path = "src/lib.rs"
-
