@@ -1,7 +1,10 @@
-//! SQL dialect metadata, parsing hooks, formatting hooks, and schema helpers.
+//! SQL dialect metadata, parsing, grammar, formatting hooks, and schema helpers.
 
+pub mod ast;
 pub mod dialect;
+pub mod grammar;
 pub mod metamodel;
+pub mod parser;
 pub mod params;
 pub mod schema;
 

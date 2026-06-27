@@ -80,6 +80,15 @@ pub trait SqlDialect: Send + Sync {
         }
     }
 
+    /// Quote each part of a qualified identifier only when needed.
+    fn quote_qualified_identifier_if_needed(&self, parts: &[&str]) -> String {
+        parts
+            .iter()
+            .map(|part| self.quote_identifier_if_needed(part))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
     /// Positional placeholder for parameters. Postgres uses `$1`, SQL Server
     /// uses `@P1`, Oracle uses `:1`, and MySQL/SQLite use `?`.
     fn placeholder(&self, n: usize) -> String;
@@ -251,7 +260,7 @@ fn contains_keyword(keywords: &[&str], word: &str) -> bool {
         .any(|keyword| keyword.eq_ignore_ascii_case(word))
 }
 
-fn is_bare_identifier(value: &str) -> bool {
+pub fn is_bare_identifier(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
         return false;
