@@ -218,6 +218,7 @@ pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
             &source_hash_sql,
             &keys,
         )),
+        partition_fingerprint_block(spec.source_engine, &source_hash_sql, &keys, &spec),
     ]);
     let target_sql = join_blocks([
         target_load_sql(&spec),
@@ -231,6 +232,7 @@ pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
             &target_hash_sql,
             &keys,
         )),
+        partition_fingerprint_block(spec.target_engine, &target_hash_sql, &keys, &spec),
     ]);
     let diff_sql = statement(&keyed_diff_sql(spec.target_engine, &keys, spec.diff_limit));
     let warnings = build_warnings(&spec, &keys, &compare_columns);
@@ -280,10 +282,17 @@ pub fn row_hash_select_sql(
         .map(|column| format!("  {}", column_ref(engine, column)))
         .collect::<Vec<_>>();
     let hash = row_hash_expression(engine, hash_columns, spec);
+    let mut projected = select_columns;
+    if !spec.partition_column.trim().is_empty() {
+        projected.push(format!(
+            "  {} AS irodori_partition",
+            column_ref(engine, &spec.partition_column)
+        ));
+    }
     let mut lines = vec![
         "-- Row hash manifest query.".to_string(),
         "SELECT".to_string(),
-        select_columns
+        projected
             .into_iter()
             .chain([format!("  {hash} AS irodori_row_hash")])
             .collect::<Vec<_>>()
@@ -318,36 +327,12 @@ pub fn row_hash_expression(
             format!("LOWER(SHA2({concatenated}, 256))")
         }
         MigrationEngine::Snowflake => format!("LOWER(SHA2({concatenated}, 256))"),
+        MigrationEngine::TrinoPresto => format!("LOWER(TO_HEX(MD5(TO_UTF8({concatenated}))))"),
         _ => format!("LOWER(MD5({concatenated}))"),
     }
 }
 
 pub fn fingerprint_sql(engine: MigrationEngine, row_hash_sql: &str, keys: &[String]) -> String {
-    let key_count = if keys.is_empty() {
-        "0 AS key_count,".to_string()
-    } else {
-        let key_values = keys
-            .iter()
-            .map(|key| {
-                normalized_column_value(
-                    engine,
-                    key,
-                    &MigrationSpec {
-                        null_token: "__IRODORI_NULL__".to_string(),
-                        delimiter: "|#|".to_string(),
-                        normalize_whitespace: false,
-                        normalize_case: false,
-                        ..MigrationSpec::default()
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        format!(
-            "COUNT(DISTINCT {}) AS key_count,",
-            concat_expression(engine, &key_values, "|#|")
-        )
-    };
-
     [
         "-- Fast validation fingerprint. Use this before running row-level diff.".to_string(),
         "WITH row_hashes AS (".to_string(),
@@ -355,10 +340,40 @@ pub fn fingerprint_sql(engine: MigrationEngine, row_hash_sql: &str, keys: &[Stri
         ")".to_string(),
         "SELECT".to_string(),
         "  COUNT(*) AS row_count,".to_string(),
-        format!("  {key_count}"),
+        format!("  {}", key_count_projection(engine, keys)),
         "  MIN(irodori_row_hash) AS min_row_hash,".to_string(),
         "  MAX(irodori_row_hash) AS max_row_hash".to_string(),
         "FROM row_hashes".to_string(),
+    ]
+    .join("\n")
+}
+
+pub fn partition_fingerprint_sql(
+    engine: MigrationEngine,
+    row_hash_sql: &str,
+    partition_alias: &str,
+    keys: &[String],
+) -> String {
+    let partition = partition_alias.trim();
+    if partition.is_empty() {
+        return fingerprint_sql(engine, row_hash_sql, keys);
+    }
+    let partition_ref = identifier_ref(engine, partition);
+
+    [
+        "-- Partition fingerprint. Run row-level diff only for failed partitions.".to_string(),
+        "WITH row_hashes AS (".to_string(),
+        indent(row_hash_sql),
+        ")".to_string(),
+        "SELECT".to_string(),
+        format!("  {partition_ref} AS irodori_partition,"),
+        "  COUNT(*) AS row_count,".to_string(),
+        format!("  {}", key_count_projection(engine, keys)),
+        "  MIN(irodori_row_hash) AS min_row_hash,".to_string(),
+        "  MAX(irodori_row_hash) AS max_row_hash".to_string(),
+        "FROM row_hashes".to_string(),
+        format!("GROUP BY {partition_ref}"),
+        format!("ORDER BY {partition_ref}"),
     ]
     .join("\n")
 }
@@ -605,6 +620,13 @@ fn hive_export_sql(spec: &MigrationSpec, keys: &[String], hash_columns: &[String
         .map(|column| format!("  {}", column_ref(MigrationEngine::Hive, column)))
         .collect::<Vec<_>>();
     let hash = row_hash_expression(MigrationEngine::Hive, hash_columns, spec);
+    let mut projected = select_columns;
+    if !spec.partition_column.trim().is_empty() {
+        projected.push(format!(
+            "  {} AS irodori_partition",
+            column_ref(MigrationEngine::Hive, &spec.partition_column)
+        ));
+    }
     let stored_as = match spec.export_format {
         MigrationExportFormat::Parquet => "STORED AS PARQUET".to_string(),
         MigrationExportFormat::Csv => {
@@ -621,7 +643,7 @@ fn hive_export_sql(spec: &MigrationSpec, keys: &[String], hash_columns: &[String
         "INSERT OVERWRITE DIRECTORY '${EXPORT_PATH}'".to_string(),
         stored_as,
         "SELECT".to_string(),
-        select_columns
+        projected
             .into_iter()
             .chain([format!("  {hash} AS irodori_row_hash")])
             .collect::<Vec<_>>()
@@ -683,9 +705,10 @@ fn normalized_column_value(engine: MigrationEngine, column: &str, spec: &Migrati
         MigrationEngine::DuckDb | MigrationEngine::Iceberg | MigrationEngine::S3Tables => {
             format!("CAST({reference} AS VARCHAR)")
         }
-        MigrationEngine::Hive | MigrationEngine::Databricks | MigrationEngine::TrinoPresto => {
+        MigrationEngine::Hive | MigrationEngine::Databricks => {
             format!("CAST({reference} AS STRING)")
         }
+        MigrationEngine::TrinoPresto => format!("CAST({reference} AS VARCHAR)"),
     };
     if spec.normalize_whitespace {
         value = regexp_replace_whitespace(engine, &value);
@@ -718,6 +741,50 @@ fn concat_expression(engine: MigrationEngine, values: &[String], delimiter: &str
         "CONCAT_WS({}, {})",
         sql_string(delimiter),
         values.join(", ")
+    )
+}
+
+fn partition_fingerprint_block(
+    engine: MigrationEngine,
+    row_hash_sql: &str,
+    keys: &[String],
+    spec: &MigrationSpec,
+) -> String {
+    if spec.partition_column.trim().is_empty() {
+        String::new()
+    } else {
+        statement(&partition_fingerprint_sql(
+            engine,
+            row_hash_sql,
+            "irodori_partition",
+            keys,
+        ))
+    }
+}
+
+fn key_count_projection(engine: MigrationEngine, keys: &[String]) -> String {
+    if keys.is_empty() {
+        return "0 AS key_count,".to_string();
+    }
+    let key_values = keys
+        .iter()
+        .map(|key| {
+            normalized_column_value(
+                engine,
+                key,
+                &MigrationSpec {
+                    null_token: "__IRODORI_NULL__".to_string(),
+                    delimiter: "|#|".to_string(),
+                    normalize_whitespace: false,
+                    normalize_case: false,
+                    ..MigrationSpec::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "COUNT(DISTINCT {}) AS key_count,",
+        concat_expression(engine, &key_values, "|#|")
     )
 }
 
@@ -1110,6 +1177,8 @@ mod tests {
             .contains("INSERT OVERWRITE DIRECTORY '${EXPORT_PATH}'"));
         assert!(plan.source_sql.contains("STORED AS PARQUET"));
         assert!(plan.source_sql.contains("LOWER(MD5(CONCAT_WS"));
+        assert!(plan.source_sql.contains("sales_dt AS irodori_partition"));
+        assert!(plan.source_sql.contains("Partition fingerprint"));
         assert!(plan.target_sql.contains("COPY INTO analytics.orders"));
         assert!(plan.diff_sql.contains("FULL OUTER JOIN"));
         assert!(plan
@@ -1167,6 +1236,19 @@ mod tests {
         assert!(sql.contains("LEFT JOIN target_rows"));
         assert!(sql.contains("`line id`"));
         assert!(sql.ends_with("LIMIT 500"));
+    }
+
+    #[test]
+    fn trino_hash_uses_varbinary_md5_shape() {
+        let spec = MigrationSpec {
+            compare_columns: vec!["payload".to_string()],
+            ..MigrationSpec::default()
+        };
+
+        let sql = row_hash_expression(MigrationEngine::TrinoPresto, &spec.compare_columns, &spec);
+
+        assert!(sql.contains("TO_HEX(MD5(TO_UTF8("));
+        assert!(sql.contains("CAST(payload AS VARCHAR)"));
     }
 
     #[test]

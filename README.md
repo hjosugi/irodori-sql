@@ -11,7 +11,8 @@ This crate contains the pieces that are useful outside the desktop app:
 - cross-engine migration planning helpers for Hive, Snowflake, PostgreSQL,
   MySQL/MariaDB, Oracle, DuckDB, Iceberg REST, and S3 Tables;
 - deterministic row-hash, fingerprint, manifest-table, and high-signal diff SQL
-  builders for validating large data moves.
+  builders for validating large data moves, including partition fingerprints
+  before row-level diff.
 
 It intentionally has no dependency on the Irodori desktop shell.
 
@@ -32,8 +33,8 @@ println!("{}", plan.diff_sql);   // keyed row-hash diff
 ```
 
 The generated validation flow is count -> key count -> hash fingerprint ->
-row-level diff, so callers can avoid expensive row-by-row inspection until a
-partition or batch fails the cheap gates.
+partition fingerprint -> row-level diff, so callers can avoid expensive
+row-by-row inspection until a partition or batch fails the cheap gates.
 
 ## Development
 
