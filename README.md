@@ -62,3 +62,16 @@ cargo test
 
 Irodori Table consumes this crate as a version-tagged Git dependency so the app
 can stay slimmer while the SQL contract evolves independently.
+
+## License
+
+Irodori-authored code in this repository is available under `MIT OR 0BSD` unless
+a file says otherwise. See [LICENSE](LICENSE).
+
+## Disclaimer
+
+SQL generation, formatting, migration, and diff helpers can produce incomplete
+or destructive statements when used with real systems. Review generated SQL,
+permissions, query plans, backups, and target connections before execution. For
+the broader product disclaimer, see
+<https://hjosugi.github.io/irodori-docs/disclaimer.html>.
