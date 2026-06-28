@@ -13,6 +13,8 @@ This crate contains the pieces that are useful outside the desktop app:
 - deterministic row-hash, fingerprint, manifest-table, and high-signal diff SQL
   builders for validating large data moves, including partition fingerprints
   before row-level diff.
+- migration snippets for PK hash checks, FK integrity checks, TSV loading, and
+  failed-bucket row diffs with VS Code-style tabstop variables.
 
 It intentionally has no dependency on the Irodori desktop shell.
 
@@ -35,6 +37,22 @@ println!("{}", plan.diff_sql);   // keyed row-hash diff
 The generated validation flow is count -> key count -> hash fingerprint ->
 partition fingerprint -> row-level diff, so callers can avoid expensive
 row-by-row inspection until a partition or batch fails the cheap gates.
+
+Snippets expose both a named-variable SQL template and a VS Code-compatible
+body:
+
+```rust
+use irodori_sql::migration::{build_migration_snippets, MigrationSnippetKind};
+
+let snippets = build_migration_snippets(&spec, &[]);
+let diff = snippets
+    .iter()
+    .find(|snippet| snippet.kind == MigrationSnippetKind::FailedBucketDiff)
+    .unwrap();
+
+println!("{}", diff.sql);  // ... '${IRODORI_HASH_BUCKET}' ...
+println!("{}", diff.body); // ... '${1:hash_bucket}' ...
+```
 
 ## Development
 

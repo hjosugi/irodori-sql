@@ -53,6 +53,7 @@ impl MigrationEngine {
 pub enum MigrationExportFormat {
     Parquet,
     Csv,
+    Tsv,
 }
 
 impl MigrationExportFormat {
@@ -60,6 +61,7 @@ impl MigrationExportFormat {
         match self {
             Self::Parquet => "PARQUET",
             Self::Csv => "CSV",
+            Self::Tsv => "TSV",
         }
     }
 }
@@ -79,6 +81,45 @@ pub struct MigrationTask {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeySpec {
+    pub name: String,
+    pub child_table: String,
+    pub parent_table: String,
+    pub child_columns: Vec<String>,
+    pub parent_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationSnippetKind {
+    PrimaryKeyHash,
+    HashBucketFingerprint,
+    FailedBucketDiff,
+    ForeignKeyHash,
+    TsvLoad,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationSnippet {
+    pub title: String,
+    pub detail: String,
+    pub kind: MigrationSnippetKind,
+    /// SQL with named `${IRODORI_*}` variables for engines or CLIs that do their
+    /// own substitution.
+    pub sql: String,
+    /// VS Code-compatible snippet body with numbered tabstops.
+    pub body: String,
+    pub variables: Vec<MigrationSnippetVariable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationSnippetVariable {
+    pub name: String,
+    pub tabstop: usize,
+    pub default_value: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationSpec {
     pub source_engine: MigrationEngine,
     pub target_engine: MigrationEngine,
@@ -93,6 +134,7 @@ pub struct MigrationSpec {
     pub export_format: MigrationExportFormat,
     pub batch_size: u64,
     pub diff_limit: usize,
+    pub hash_bucket_prefix_len: usize,
     pub null_token: String,
     pub delimiter: String,
     pub normalize_whitespace: bool,
@@ -131,6 +173,7 @@ impl MigrationSpec {
             export_format: MigrationExportFormat::Parquet,
             batch_size: 5_000_000,
             diff_limit: 1_000,
+            hash_bucket_prefix_len: 4,
             null_token: "__IRODORI_NULL__".to_string(),
             delimiter: "|#|".to_string(),
             normalize_whitespace: true,
@@ -144,6 +187,7 @@ impl MigrationSpec {
         next.compare_columns = unique_case_insensitive(next.compare_columns);
         next.batch_size = next.batch_size.clamp(1_000, 100_000_000);
         next.diff_limit = next.diff_limit.clamp(10, 100_000);
+        next.hash_bucket_prefix_len = next.hash_bucket_prefix_len.clamp(1, 12);
         if next.null_token.is_empty() {
             next.null_token = "__IRODORI_NULL__".to_string();
         }
@@ -234,7 +278,26 @@ pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
         )),
         partition_fingerprint_block(spec.target_engine, &target_hash_sql, &keys, &spec),
     ]);
-    let diff_sql = statement(&keyed_diff_sql(spec.target_engine, &keys, spec.diff_limit));
+    let partitioned = !spec.partition_column.trim().is_empty();
+    let diff_sql = if keys.is_empty() {
+        statement(&keyed_diff_sql(spec.target_engine, &keys, spec.diff_limit))
+    } else {
+        join_blocks([
+            statement(&hash_bucket_diff_sql(
+                spec.target_engine,
+                partitioned,
+                spec.hash_bucket_prefix_len,
+                spec.diff_limit,
+            )),
+            statement(&failed_bucket_row_diff_sql(
+                spec.target_engine,
+                &keys,
+                partitioned,
+                spec.hash_bucket_prefix_len,
+                spec.diff_limit,
+            )),
+        ])
+    };
     let warnings = build_warnings(&spec, &keys, &compare_columns);
     let pair_notes = build_pair_notes(&spec);
     let tasks = build_tasks(&spec, &keys, &hash_columns);
@@ -263,6 +326,120 @@ pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
     }
 }
 
+pub fn build_migration_snippets(
+    spec: &MigrationSpec,
+    foreign_keys: &[ForeignKeySpec],
+) -> Vec<MigrationSnippet> {
+    let spec = spec.normalized();
+    let partitioned = !spec.partition_column.trim().is_empty();
+    let mut snippets = Vec::new();
+
+    if !spec.key_columns.is_empty() {
+        snippets.push(migration_snippet(
+            "Primary-key hash profile",
+            "Find duplicate business keys and show the deterministic PK hash.",
+            MigrationSnippetKind::PrimaryKeyHash,
+            statement(&key_hash_profile_sql(
+                spec.source_engine,
+                &spec.source_table,
+                &spec.key_columns,
+                &spec.partition_predicate,
+                &spec,
+                spec.diff_limit,
+            )),
+            vec![],
+        ));
+        snippets.push(migration_snippet(
+            "Hash bucket fingerprint diff",
+            "Compare source/target manifests by PK hash prefix before row-level diff.",
+            MigrationSnippetKind::HashBucketFingerprint,
+            statement(&hash_bucket_diff_sql(
+                spec.target_engine,
+                partitioned,
+                spec.hash_bucket_prefix_len,
+                spec.diff_limit,
+            )),
+            vec![],
+        ));
+        let mut variables = vec![snippet_variable(
+            "IRODORI_HASH_BUCKET",
+            1,
+            "hash_bucket",
+            "Hash bucket returned by the bucket-level diff.",
+        )];
+        if partitioned {
+            variables.push(snippet_variable(
+                "IRODORI_PARTITION",
+                2,
+                "partition_value",
+                "Partition returned by the bucket-level diff.",
+            ));
+        }
+        snippets.push(migration_snippet(
+            "Failed bucket row diff",
+            "Set IRODORI_HASH_BUCKET and optional IRODORI_PARTITION to inspect only failed rows.",
+            MigrationSnippetKind::FailedBucketDiff,
+            statement(&failed_bucket_row_diff_sql(
+                spec.target_engine,
+                &spec.key_columns,
+                partitioned,
+                spec.hash_bucket_prefix_len,
+                spec.diff_limit,
+            )),
+            variables,
+        ));
+    }
+
+    if spec.export_format == MigrationExportFormat::Tsv {
+        snippets.push(migration_snippet(
+            "TSV load",
+            "Use explicit tab-delimited file-format settings for Hive text exports.",
+            MigrationSnippetKind::TsvLoad,
+            statement(&target_load_sql(&spec)),
+            vec![snippet_variable(
+                "EXPORT_PATH",
+                1,
+                "s3://bucket/path",
+                "External storage path used by DuckDB/Iceberg loaders.",
+            )],
+        ));
+    }
+
+    for foreign_key in foreign_keys {
+        snippets.push(migration_snippet(
+            format!("Foreign-key hash check: {}", foreign_key.name),
+            format!(
+                "{} -> {}",
+                foreign_key.child_table, foreign_key.parent_table
+            ),
+            MigrationSnippetKind::ForeignKeyHash,
+            statement(&foreign_key_integrity_sql(
+                spec.target_engine,
+                foreign_key,
+                &spec,
+                spec.diff_limit,
+            )),
+            vec![],
+        ));
+    }
+
+    snippets
+}
+
+pub fn vscode_snippet_body(sql: &str, variables: &[MigrationSnippetVariable]) -> String {
+    let mut body = sql.to_string();
+    for variable in variables {
+        let token = format!("${{{}}}", variable.name);
+        let placeholder = format!(
+            "${{{}:{}}}",
+            variable.tabstop,
+            escape_vscode_snippet_placeholder(&variable.default_value)
+        );
+        body = body.replace(&token, &placeholder);
+    }
+    body
+}
+
 pub fn row_hash_select_sql(
     engine: MigrationEngine,
     table: &str,
@@ -287,6 +464,12 @@ pub fn row_hash_select_sql(
         projected.push(format!(
             "  {} AS irodori_partition",
             column_ref(engine, &spec.partition_column)
+        ));
+    }
+    if !keys.is_empty() {
+        projected.push(format!(
+            "  {} AS irodori_key_hash",
+            key_hash_expression(engine, keys, spec)
         ));
     }
     let mut lines = vec![
@@ -330,6 +513,14 @@ pub fn row_hash_expression(
         MigrationEngine::TrinoPresto => format!("LOWER(TO_HEX(MD5(TO_UTF8({concatenated}))))"),
         _ => format!("LOWER(MD5({concatenated}))"),
     }
+}
+
+pub fn key_hash_expression(
+    engine: MigrationEngine,
+    key_columns: &[String],
+    spec: &MigrationSpec,
+) -> String {
+    row_hash_expression(engine, key_columns, spec)
 }
 
 pub fn fingerprint_sql(engine: MigrationEngine, row_hash_sql: &str, keys: &[String]) -> String {
@@ -378,6 +569,322 @@ pub fn partition_fingerprint_sql(
     .join("\n")
 }
 
+pub fn key_hash_profile_sql(
+    engine: MigrationEngine,
+    table: &str,
+    keys: &[String],
+    predicate: &str,
+    spec: &MigrationSpec,
+    limit: usize,
+) -> String {
+    if keys.is_empty() {
+        return "-- Primary-key hash profile needs key columns.".to_string();
+    }
+    let key_columns = keys
+        .iter()
+        .map(|key| format!("  {}", column_ref(engine, key)))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let key_group = keys
+        .iter()
+        .map(|key| column_ref(engine, key))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut lines = vec![
+        "-- Primary-key hash profile. Duplicate keys are migration blockers.".to_string(),
+        "SELECT".to_string(),
+        format!("{key_columns},"),
+        format!(
+            "  {} AS irodori_key_hash,",
+            key_hash_expression(engine, keys, spec)
+        ),
+        "  COUNT(*) AS rows_per_key".to_string(),
+        format!("FROM {}", table_ref(engine, table)),
+    ];
+    if !predicate.trim().is_empty() {
+        lines.push(format!("WHERE {}", predicate.trim()));
+    }
+    lines.extend([
+        format!("GROUP BY {key_group}"),
+        "HAVING COUNT(*) > 1".to_string(),
+        "ORDER BY rows_per_key DESC".to_string(),
+        limit_clause(engine, limit),
+    ]);
+    lines.join("\n")
+}
+
+pub fn hash_bucket_fingerprint_sql(
+    engine: MigrationEngine,
+    manifest_table: &str,
+    partitioned: bool,
+    bucket_prefix_len: usize,
+) -> String {
+    hash_bucket_fingerprint_sql_inner(engine, manifest_table, partitioned, bucket_prefix_len, true)
+}
+
+fn hash_bucket_fingerprint_sql_inner(
+    engine: MigrationEngine,
+    manifest_table: &str,
+    partitioned: bool,
+    bucket_prefix_len: usize,
+    include_order_by: bool,
+) -> String {
+    let bucket_expr = hash_bucket_expr("irodori_key_hash", bucket_prefix_len);
+    let partition_projection = if partitioned {
+        "  COALESCE(irodori_partition, '__IRODORI_NULL_PARTITION__') AS irodori_partition,\n"
+    } else {
+        ""
+    };
+    let group_by = if partitioned {
+        format!("GROUP BY COALESCE(irodori_partition, '__IRODORI_NULL_PARTITION__'), {bucket_expr}")
+    } else {
+        format!("GROUP BY {bucket_expr}")
+    };
+    let order_by = if partitioned {
+        "ORDER BY irodori_partition, irodori_hash_bucket"
+    } else {
+        "ORDER BY irodori_hash_bucket"
+    };
+    let mut lines = vec![
+        "-- Hash bucket fingerprint. Use this before row-level diff on very large tables."
+            .to_string(),
+        "SELECT".to_string(),
+        format!("{partition_projection}  {bucket_expr} AS irodori_hash_bucket,"),
+        "  COUNT(*) AS row_count,".to_string(),
+        "  COUNT(DISTINCT irodori_key_hash) AS key_count,".to_string(),
+        "  MIN(irodori_row_hash) AS min_row_hash,".to_string(),
+        "  MAX(irodori_row_hash) AS max_row_hash".to_string(),
+        format!("FROM {}", table_ref(engine, manifest_table)),
+        group_by,
+    ];
+    if include_order_by {
+        lines.push(order_by.to_string());
+    }
+
+    lines.join("\n")
+}
+
+pub fn hash_bucket_diff_sql(
+    engine: MigrationEngine,
+    partitioned: bool,
+    bucket_prefix_len: usize,
+    diff_limit: usize,
+) -> String {
+    if matches!(engine, MigrationEngine::MySql | MigrationEngine::MariaDb) {
+        return mysql_hash_bucket_diff_sql(engine, partitioned, bucket_prefix_len, diff_limit);
+    }
+
+    let source_sql = hash_bucket_fingerprint_sql_inner(
+        engine,
+        "irodori_source_manifest",
+        partitioned,
+        bucket_prefix_len,
+        false,
+    );
+    let target_sql = hash_bucket_fingerprint_sql_inner(
+        engine,
+        "irodori_target_manifest",
+        partitioned,
+        bucket_prefix_len,
+        false,
+    );
+    let partition_projection = if partitioned {
+        "  COALESCE(s.irodori_partition, t.irodori_partition) AS irodori_partition,\n"
+    } else {
+        ""
+    };
+    let partition_join = if partitioned {
+        "s.irodori_partition = t.irodori_partition\n  AND "
+    } else {
+        ""
+    };
+    let order_by = if partitioned { "1, 2" } else { "1" };
+
+    [
+        "-- Bucket-level diff. Feed the returned bucket into failed_bucket_row_diff_sql."
+            .to_string(),
+        "WITH source_buckets AS (".to_string(),
+        indent(&source_sql),
+        "),".to_string(),
+        "target_buckets AS (".to_string(),
+        indent(&target_sql),
+        ")".to_string(),
+        "SELECT".to_string(),
+        format!(
+            "{partition_projection}  COALESCE(s.irodori_hash_bucket, t.irodori_hash_bucket) AS irodori_hash_bucket,"
+        ),
+        "  CASE".to_string(),
+        "    WHEN s.irodori_hash_bucket IS NULL THEN 'target_only_bucket'".to_string(),
+        "    WHEN t.irodori_hash_bucket IS NULL THEN 'source_only_bucket'".to_string(),
+        "    ELSE 'changed_bucket'".to_string(),
+        "  END AS diff_kind,".to_string(),
+        "  s.row_count AS source_row_count,".to_string(),
+        "  t.row_count AS target_row_count,".to_string(),
+        "  s.key_count AS source_key_count,".to_string(),
+        "  t.key_count AS target_key_count,".to_string(),
+        "  s.min_row_hash AS source_min_row_hash,".to_string(),
+        "  t.min_row_hash AS target_min_row_hash,".to_string(),
+        "  s.max_row_hash AS source_max_row_hash,".to_string(),
+        "  t.max_row_hash AS target_max_row_hash".to_string(),
+        "FROM source_buckets s".to_string(),
+        "FULL OUTER JOIN target_buckets t".to_string(),
+        format!("  ON {partition_join}s.irodori_hash_bucket = t.irodori_hash_bucket"),
+        "WHERE s.irodori_hash_bucket IS NULL".to_string(),
+        "   OR t.irodori_hash_bucket IS NULL".to_string(),
+        "   OR s.row_count <> t.row_count".to_string(),
+        "   OR s.key_count <> t.key_count".to_string(),
+        "   OR s.min_row_hash <> t.min_row_hash".to_string(),
+        "   OR s.max_row_hash <> t.max_row_hash".to_string(),
+        format!("ORDER BY {order_by}"),
+        limit_clause(engine, diff_limit),
+    ]
+    .join("\n")
+}
+
+pub fn failed_bucket_row_diff_sql(
+    engine: MigrationEngine,
+    keys: &[String],
+    partitioned: bool,
+    bucket_prefix_len: usize,
+    diff_limit: usize,
+) -> String {
+    if keys.is_empty() {
+        return [
+            "-- Row-level diff needs a stable business key.",
+            "-- Add key columns, regenerate this plan, then load both manifest tables.",
+        ]
+        .join("\n");
+    }
+    if matches!(engine, MigrationEngine::MySql | MigrationEngine::MariaDb) {
+        return mysql_failed_bucket_row_diff_sql(
+            engine,
+            keys,
+            partitioned,
+            bucket_prefix_len,
+            diff_limit,
+        );
+    }
+
+    let key_projection = keys
+        .iter()
+        .map(|key| {
+            let quoted = identifier_ref(engine, key);
+            format!("  COALESCE(s.{quoted}, t.{quoted}) AS {quoted}")
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let join = key_join(engine, keys);
+    let order_by = positional_order_by(keys.len());
+    let source_filter = manifest_bucket_filter(bucket_prefix_len, partitioned);
+    let target_filter = source_filter.clone();
+
+    [
+        "-- Row-level diff scoped to one failed hash bucket.".to_string(),
+        "WITH source_rows AS (".to_string(),
+        format!(
+            "  SELECT * FROM {}\n  WHERE {}",
+            table_ref(engine, "irodori_source_manifest"),
+            source_filter
+        ),
+        "),".to_string(),
+        "target_rows AS (".to_string(),
+        format!(
+            "  SELECT * FROM {}\n  WHERE {}",
+            table_ref(engine, "irodori_target_manifest"),
+            target_filter
+        ),
+        ")".to_string(),
+        "SELECT".to_string(),
+        format!("{key_projection},"),
+        "  CASE".to_string(),
+        "    WHEN s.irodori_row_hash IS NULL THEN 'target_only'".to_string(),
+        "    WHEN t.irodori_row_hash IS NULL THEN 'source_only'".to_string(),
+        "    ELSE 'changed'".to_string(),
+        "  END AS diff_kind,".to_string(),
+        "  s.irodori_row_hash AS source_hash,".to_string(),
+        "  t.irodori_row_hash AS target_hash".to_string(),
+        "FROM source_rows s".to_string(),
+        "FULL OUTER JOIN target_rows t".to_string(),
+        format!("  ON {join}"),
+        "WHERE s.irodori_row_hash IS NULL".to_string(),
+        "   OR t.irodori_row_hash IS NULL".to_string(),
+        "   OR s.irodori_row_hash <> t.irodori_row_hash".to_string(),
+        format!("ORDER BY {order_by}"),
+        limit_clause(engine, diff_limit),
+    ]
+    .join("\n")
+}
+
+pub fn foreign_key_integrity_sql(
+    engine: MigrationEngine,
+    foreign_key: &ForeignKeySpec,
+    spec: &MigrationSpec,
+    diff_limit: usize,
+) -> String {
+    if foreign_key.child_columns.is_empty()
+        || foreign_key.parent_columns.is_empty()
+        || foreign_key.child_columns.len() != foreign_key.parent_columns.len()
+    {
+        return "-- Foreign-key hash check needs matching child and parent columns.".to_string();
+    }
+
+    let child_hash_columns = qualified_columns("c", &foreign_key.child_columns);
+    let parent_hash_columns = qualified_columns("p", &foreign_key.parent_columns);
+    let child_hash = key_hash_expression(engine, &child_hash_columns, spec);
+    let parent_hash = key_hash_expression(engine, &parent_hash_columns, spec);
+    let child_not_null = not_null_predicate(engine, "c", &foreign_key.child_columns);
+    let parent_not_null = not_null_predicate(engine, "p", &foreign_key.parent_columns);
+
+    if matches!(engine, MigrationEngine::MySql | MigrationEngine::MariaDb) {
+        return mysql_foreign_key_integrity_sql(
+            engine,
+            foreign_key,
+            &child_hash,
+            &parent_hash,
+            &child_not_null,
+            &parent_not_null,
+            diff_limit,
+        );
+    }
+
+    [
+        format!("-- Foreign-key hash integrity check: {}", foreign_key.name),
+        "WITH child_keys AS (".to_string(),
+        "  SELECT".to_string(),
+        format!("    {child_hash} AS fk_hash,"),
+        "    COUNT(*) AS child_row_count".to_string(),
+        format!("  FROM {} c", table_ref(engine, &foreign_key.child_table)),
+        format!("  WHERE {child_not_null}"),
+        format!("  GROUP BY {child_hash}"),
+        "),".to_string(),
+        "parent_keys AS (".to_string(),
+        "  SELECT".to_string(),
+        format!("    {parent_hash} AS fk_hash,"),
+        "    COUNT(*) AS parent_row_count".to_string(),
+        format!("  FROM {} p", table_ref(engine, &foreign_key.parent_table)),
+        format!("  WHERE {parent_not_null}"),
+        format!("  GROUP BY {parent_hash}"),
+        ")".to_string(),
+        "SELECT".to_string(),
+        "  COALESCE(c.fk_hash, p.fk_hash) AS fk_hash,".to_string(),
+        "  CASE".to_string(),
+        "    WHEN p.fk_hash IS NULL THEN 'orphan_child'".to_string(),
+        "    WHEN c.fk_hash IS NULL THEN 'parent_only'".to_string(),
+        "    ELSE 'matched'".to_string(),
+        "  END AS fk_status,".to_string(),
+        "  c.child_row_count,".to_string(),
+        "  p.parent_row_count".to_string(),
+        "FROM child_keys c".to_string(),
+        "FULL OUTER JOIN parent_keys p".to_string(),
+        "  ON c.fk_hash = p.fk_hash".to_string(),
+        "WHERE c.fk_hash IS NULL".to_string(),
+        "   OR p.fk_hash IS NULL".to_string(),
+        "ORDER BY fk_status, fk_hash".to_string(),
+        limit_clause(engine, diff_limit),
+    ]
+    .join("\n")
+}
+
 pub fn manifest_table_sql(
     engine: MigrationEngine,
     keys: &[String],
@@ -388,6 +895,9 @@ pub fn manifest_table_sql(
         .iter()
         .map(|key| format!("  {} {text_type}", identifier_ref(engine, key)))
         .collect::<Vec<_>>();
+    if !keys.is_empty() {
+        columns.push(format!("  irodori_key_hash {text_type}"));
+    }
     columns.push(format!("  irodori_row_hash {text_type}"));
     if !partition_column.trim().is_empty() {
         columns.push(format!("  irodori_partition {text_type}"));
@@ -525,6 +1035,269 @@ fn mysql_keyed_diff_sql(engine: MigrationEngine, keys: &[String], diff_limit: us
     .join("\n")
 }
 
+fn mysql_hash_bucket_diff_sql(
+    engine: MigrationEngine,
+    partitioned: bool,
+    bucket_prefix_len: usize,
+    diff_limit: usize,
+) -> String {
+    let source_sql = hash_bucket_fingerprint_sql_inner(
+        engine,
+        "irodori_source_manifest",
+        partitioned,
+        bucket_prefix_len,
+        false,
+    );
+    let target_sql = hash_bucket_fingerprint_sql_inner(
+        engine,
+        "irodori_target_manifest",
+        partitioned,
+        bucket_prefix_len,
+        false,
+    );
+    let source_projection = if partitioned {
+        "  s.irodori_partition,\n  s.irodori_hash_bucket,"
+    } else {
+        "  s.irodori_hash_bucket,"
+    };
+    let target_projection = if partitioned {
+        "  t.irodori_partition,\n  t.irodori_hash_bucket,"
+    } else {
+        "  t.irodori_hash_bucket,"
+    };
+    let join = if partitioned {
+        "s.irodori_partition = t.irodori_partition AND s.irodori_hash_bucket = t.irodori_hash_bucket"
+    } else {
+        "s.irodori_hash_bucket = t.irodori_hash_bucket"
+    };
+    let null_check = if partitioned {
+        "t.irodori_partition IS NULL AND t.irodori_hash_bucket IS NULL"
+    } else {
+        "t.irodori_hash_bucket IS NULL"
+    };
+    let reverse_null_check = if partitioned {
+        "s.irodori_partition IS NULL AND s.irodori_hash_bucket IS NULL"
+    } else {
+        "s.irodori_hash_bucket IS NULL"
+    };
+    let order_by = if partitioned { "1, 2" } else { "1" };
+
+    [
+        "-- MySQL/MariaDB bucket-level diff with full-join emulation.".to_string(),
+        "WITH source_buckets AS (".to_string(),
+        indent(&source_sql),
+        "),".to_string(),
+        "target_buckets AS (".to_string(),
+        indent(&target_sql),
+        ")".to_string(),
+        "SELECT".to_string(),
+        source_projection.to_string(),
+        "  CASE WHEN t.irodori_hash_bucket IS NULL THEN 'source_only_bucket' ELSE 'changed_bucket' END AS diff_kind,"
+            .to_string(),
+        "  s.row_count AS source_row_count,".to_string(),
+        "  t.row_count AS target_row_count,".to_string(),
+        "  s.key_count AS source_key_count,".to_string(),
+        "  t.key_count AS target_key_count,".to_string(),
+        "  s.min_row_hash AS source_min_row_hash,".to_string(),
+        "  t.min_row_hash AS target_min_row_hash,".to_string(),
+        "  s.max_row_hash AS source_max_row_hash,".to_string(),
+        "  t.max_row_hash AS target_max_row_hash".to_string(),
+        "FROM source_buckets s".to_string(),
+        "LEFT JOIN target_buckets t".to_string(),
+        format!("  ON {join}"),
+        format!("WHERE {null_check}"),
+        "   OR s.row_count <> t.row_count".to_string(),
+        "   OR s.key_count <> t.key_count".to_string(),
+        "   OR s.min_row_hash <> t.min_row_hash".to_string(),
+        "   OR s.max_row_hash <> t.max_row_hash".to_string(),
+        "UNION ALL".to_string(),
+        "SELECT".to_string(),
+        target_projection.to_string(),
+        "  'target_only_bucket' AS diff_kind,".to_string(),
+        "  s.row_count AS source_row_count,".to_string(),
+        "  t.row_count AS target_row_count,".to_string(),
+        "  s.key_count AS source_key_count,".to_string(),
+        "  t.key_count AS target_key_count,".to_string(),
+        "  s.min_row_hash AS source_min_row_hash,".to_string(),
+        "  t.min_row_hash AS target_min_row_hash,".to_string(),
+        "  s.max_row_hash AS source_max_row_hash,".to_string(),
+        "  t.max_row_hash AS target_max_row_hash".to_string(),
+        "FROM target_buckets t".to_string(),
+        "LEFT JOIN source_buckets s".to_string(),
+        format!("  ON {join}"),
+        format!("WHERE {reverse_null_check}"),
+        format!("ORDER BY {order_by}"),
+        limit_clause(engine, diff_limit),
+    ]
+    .join("\n")
+}
+
+fn mysql_failed_bucket_row_diff_sql(
+    engine: MigrationEngine,
+    keys: &[String],
+    partitioned: bool,
+    bucket_prefix_len: usize,
+    diff_limit: usize,
+) -> String {
+    let source_key_projection = keys
+        .iter()
+        .map(|key| {
+            let quoted = identifier_ref(engine, key);
+            format!("  s.{quoted} AS {quoted}")
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let target_key_projection = keys
+        .iter()
+        .map(|key| {
+            let quoted = identifier_ref(engine, key);
+            format!("  t.{quoted} AS {quoted}")
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let join = key_join(engine, keys);
+    let order_by = positional_order_by(keys.len());
+    let filter = manifest_bucket_filter(bucket_prefix_len, partitioned);
+
+    [
+        "-- MySQL/MariaDB bucket-scoped row diff with full-join emulation.".to_string(),
+        "WITH source_rows AS (".to_string(),
+        format!(
+            "  SELECT * FROM {}\n  WHERE {}",
+            table_ref(engine, "irodori_source_manifest"),
+            filter
+        ),
+        "),".to_string(),
+        "target_rows AS (".to_string(),
+        format!(
+            "  SELECT * FROM {}\n  WHERE {}",
+            table_ref(engine, "irodori_target_manifest"),
+            filter
+        ),
+        ")".to_string(),
+        "SELECT".to_string(),
+        format!("{source_key_projection},"),
+        "  CASE WHEN t.irodori_row_hash IS NULL THEN 'source_only' ELSE 'changed' END AS diff_kind,"
+            .to_string(),
+        "  s.irodori_row_hash AS source_hash,".to_string(),
+        "  t.irodori_row_hash AS target_hash".to_string(),
+        "FROM source_rows s".to_string(),
+        "LEFT JOIN target_rows t".to_string(),
+        format!("  ON {join}"),
+        "WHERE t.irodori_row_hash IS NULL".to_string(),
+        "   OR s.irodori_row_hash <> t.irodori_row_hash".to_string(),
+        "UNION ALL".to_string(),
+        "SELECT".to_string(),
+        format!("{target_key_projection},"),
+        "  'target_only' AS diff_kind,".to_string(),
+        "  s.irodori_row_hash AS source_hash,".to_string(),
+        "  t.irodori_row_hash AS target_hash".to_string(),
+        "FROM target_rows t".to_string(),
+        "LEFT JOIN source_rows s".to_string(),
+        format!("  ON {join}"),
+        "WHERE s.irodori_row_hash IS NULL".to_string(),
+        format!("ORDER BY {order_by}"),
+        limit_clause(engine, diff_limit),
+    ]
+    .join("\n")
+}
+
+fn mysql_foreign_key_integrity_sql(
+    engine: MigrationEngine,
+    foreign_key: &ForeignKeySpec,
+    child_hash: &str,
+    parent_hash: &str,
+    child_not_null: &str,
+    parent_not_null: &str,
+    diff_limit: usize,
+) -> String {
+    [
+        format!(
+            "-- Foreign-key hash integrity check with full-join emulation: {}",
+            foreign_key.name
+        ),
+        "WITH child_keys AS (".to_string(),
+        "  SELECT".to_string(),
+        format!("    {child_hash} AS fk_hash,"),
+        "    COUNT(*) AS child_row_count".to_string(),
+        format!("  FROM {} c", table_ref(engine, &foreign_key.child_table)),
+        format!("  WHERE {child_not_null}"),
+        format!("  GROUP BY {child_hash}"),
+        "),".to_string(),
+        "parent_keys AS (".to_string(),
+        "  SELECT".to_string(),
+        format!("    {parent_hash} AS fk_hash,"),
+        "    COUNT(*) AS parent_row_count".to_string(),
+        format!("  FROM {} p", table_ref(engine, &foreign_key.parent_table)),
+        format!("  WHERE {parent_not_null}"),
+        format!("  GROUP BY {parent_hash}"),
+        ")".to_string(),
+        "SELECT".to_string(),
+        "  c.fk_hash,".to_string(),
+        "  'orphan_child' AS fk_status,".to_string(),
+        "  c.child_row_count,".to_string(),
+        "  p.parent_row_count".to_string(),
+        "FROM child_keys c".to_string(),
+        "LEFT JOIN parent_keys p ON c.fk_hash = p.fk_hash".to_string(),
+        "WHERE p.fk_hash IS NULL".to_string(),
+        "UNION ALL".to_string(),
+        "SELECT".to_string(),
+        "  p.fk_hash,".to_string(),
+        "  'parent_only' AS fk_status,".to_string(),
+        "  c.child_row_count,".to_string(),
+        "  p.parent_row_count".to_string(),
+        "FROM parent_keys p".to_string(),
+        "LEFT JOIN child_keys c ON c.fk_hash = p.fk_hash".to_string(),
+        "WHERE c.fk_hash IS NULL".to_string(),
+        "ORDER BY fk_status, fk_hash".to_string(),
+        limit_clause(engine, diff_limit),
+    ]
+    .join("\n")
+}
+
+fn migration_snippet(
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    kind: MigrationSnippetKind,
+    sql: String,
+    variables: Vec<MigrationSnippetVariable>,
+) -> MigrationSnippet {
+    let variables = variables
+        .into_iter()
+        .filter(|variable| sql.contains(&format!("${{{}}}", variable.name)))
+        .collect::<Vec<_>>();
+    let body = vscode_snippet_body(&sql, &variables);
+    MigrationSnippet {
+        title: title.into(),
+        detail: detail.into(),
+        kind,
+        sql,
+        body,
+        variables,
+    }
+}
+
+fn snippet_variable(
+    name: impl Into<String>,
+    tabstop: usize,
+    default_value: impl Into<String>,
+    description: impl Into<String>,
+) -> MigrationSnippetVariable {
+    MigrationSnippetVariable {
+        name: name.into(),
+        tabstop,
+        default_value: default_value.into(),
+        description: description.into(),
+    }
+}
+
+fn escape_vscode_snippet_placeholder(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('$', "\\$")
+        .replace('}', "\\}")
+}
+
 fn source_extraction_sql(
     spec: &MigrationSpec,
     keys: &[String],
@@ -590,6 +1363,7 @@ fn duckdb_iceberg_load_sql(spec: &MigrationSpec) -> String {
     let scan = match spec.export_format {
         MigrationExportFormat::Parquet => "read_parquet('${EXPORT_PATH}/*.parquet')",
         MigrationExportFormat::Csv => "read_csv_auto('${EXPORT_PATH}/*.csv')",
+        MigrationExportFormat::Tsv => "read_csv_auto('${EXPORT_PATH}/*.tsv', delim='\\t')",
     };
     [
         duckdb_iceberg_bootstrap_sql(spec.target_engine),
@@ -627,10 +1401,19 @@ fn hive_export_sql(spec: &MigrationSpec, keys: &[String], hash_columns: &[String
             column_ref(MigrationEngine::Hive, &spec.partition_column)
         ));
     }
+    if !keys.is_empty() {
+        projected.push(format!(
+            "  {} AS irodori_key_hash",
+            key_hash_expression(MigrationEngine::Hive, keys, spec)
+        ));
+    }
     let stored_as = match spec.export_format {
         MigrationExportFormat::Parquet => "STORED AS PARQUET".to_string(),
         MigrationExportFormat::Csv => {
             "ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE".to_string()
+        }
+        MigrationExportFormat::Tsv => {
+            "ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\t' STORED AS TEXTFILE".to_string()
         }
     };
 
@@ -673,6 +1456,15 @@ fn snowflake_load_sql(spec: &MigrationSpec) -> String {
             "  SKIP_HEADER = 1".to_string(),
             "  FIELD_OPTIONALLY_ENCLOSED_BY = '\"'".to_string(),
             "  NULL_IF = ('', 'NULL');".to_string(),
+        ]
+        .join("\n"),
+        MigrationExportFormat::Tsv => [
+            format!("CREATE OR REPLACE FILE FORMAT {format_name}"),
+            "  TYPE = CSV".to_string(),
+            "  FIELD_DELIMITER = '\\t'".to_string(),
+            "  SKIP_HEADER = 0".to_string(),
+            "  EMPTY_FIELD_AS_NULL = TRUE".to_string(),
+            "  NULL_IF = ('', 'NULL', '\\\\N');".to_string(),
         ]
         .join("\n"),
     };
@@ -807,7 +1599,7 @@ fn build_warnings(
         && spec.export_format != MigrationExportFormat::Parquet
     {
         warnings.push(
-            "Hive CSV extraction is slower and riskier than Parquet for Snowflake loads."
+            "Hive text extraction is slower and riskier than Parquet for Snowflake loads; prefer TSV over CSV if Parquet is unavailable."
                 .to_string(),
         );
     }
@@ -1030,6 +1822,54 @@ fn key_join(engine: MigrationEngine, keys: &[String]) -> String {
         .join("\n  AND ")
 }
 
+fn qualified_columns(alias: &str, columns: &[String]) -> Vec<String> {
+    columns
+        .iter()
+        .map(|column| format!("{alias}.{column}"))
+        .collect()
+}
+
+fn not_null_predicate(engine: MigrationEngine, alias: &str, columns: &[String]) -> String {
+    if columns.is_empty() {
+        return "1 = 1".to_string();
+    }
+    columns
+        .iter()
+        .map(|column| {
+            format!(
+                "{alias}.{} IS NOT NULL",
+                column
+                    .split('.')
+                    .last()
+                    .map(|part| identifier_ref(engine, part))
+                    .unwrap_or_else(|| identifier_ref(engine, column))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn hash_bucket_expr(key_hash_ref: &str, bucket_prefix_len: usize) -> String {
+    format!(
+        "SUBSTR({key_hash_ref}, 1, {})",
+        bucket_prefix_len.clamp(1, 12)
+    )
+}
+
+fn manifest_bucket_filter(bucket_prefix_len: usize, partitioned: bool) -> String {
+    let mut filters = vec![format!(
+        "{} = '${{IRODORI_HASH_BUCKET}}'",
+        hash_bucket_expr("irodori_key_hash", bucket_prefix_len)
+    )];
+    if partitioned {
+        filters.push(
+            "COALESCE(irodori_partition, '__IRODORI_NULL_PARTITION__') = '${IRODORI_PARTITION}'"
+                .to_string(),
+        );
+    }
+    filters.join("\n    AND ")
+}
+
 fn positional_order_by(width: usize) -> String {
     (1..=width)
         .map(|index| index.to_string())
@@ -1178,9 +2018,11 @@ mod tests {
         assert!(plan.source_sql.contains("STORED AS PARQUET"));
         assert!(plan.source_sql.contains("LOWER(MD5(CONCAT_WS"));
         assert!(plan.source_sql.contains("sales_dt AS irodori_partition"));
+        assert!(plan.source_sql.contains("irodori_key_hash"));
         assert!(plan.source_sql.contains("Partition fingerprint"));
         assert!(plan.target_sql.contains("COPY INTO analytics.orders"));
-        assert!(plan.diff_sql.contains("FULL OUTER JOIN"));
+        assert!(plan.diff_sql.contains("Bucket-level diff"));
+        assert!(plan.diff_sql.contains("${IRODORI_HASH_BUCKET}"));
         assert!(plan
             .pair_notes
             .iter()
@@ -1236,6 +2078,55 @@ mod tests {
         assert!(sql.contains("LEFT JOIN target_rows"));
         assert!(sql.contains("`line id`"));
         assert!(sql.ends_with("LIMIT 500"));
+    }
+
+    #[test]
+    fn snippets_include_vscode_style_variables() {
+        let snippets = build_migration_snippets(&MigrationSpec::default(), &[]);
+        let failed_bucket = snippets
+            .iter()
+            .find(|snippet| snippet.kind == MigrationSnippetKind::FailedBucketDiff)
+            .expect("failed bucket snippet");
+
+        assert!(failed_bucket.sql.contains("${IRODORI_HASH_BUCKET}"));
+        assert!(failed_bucket.sql.contains("${IRODORI_PARTITION}"));
+        assert!(failed_bucket.body.contains("${1:hash_bucket}"));
+        assert!(failed_bucket.body.contains("${2:partition_value}"));
+        assert_eq!(failed_bucket.variables.len(), 2);
+        assert_eq!(failed_bucket.variables[0].name, "IRODORI_HASH_BUCKET");
+    }
+
+    #[test]
+    fn foreign_key_snippet_hashes_child_and_parent_keys() {
+        let fk = ForeignKeySpec {
+            name: "orders_customer_fk".to_string(),
+            child_table: "analytics.orders".to_string(),
+            parent_table: "analytics.customers".to_string(),
+            child_columns: vec!["customer_id".to_string()],
+            parent_columns: vec!["id".to_string()],
+        };
+        let snippets = build_migration_snippets(&MigrationSpec::default(), &[fk]);
+        let fk_snippet = snippets
+            .iter()
+            .find(|snippet| snippet.kind == MigrationSnippetKind::ForeignKeyHash)
+            .expect("fk snippet");
+
+        assert!(fk_snippet.sql.contains("Foreign-key hash integrity check"));
+        assert!(fk_snippet.sql.contains("orphan_child"));
+        assert!(fk_snippet.sql.contains("analytics.orders c"));
+        assert!(fk_snippet.sql.contains("analytics.customers p"));
+    }
+
+    #[test]
+    fn tsv_export_and_load_use_tab_delimiters() {
+        let spec = MigrationSpec {
+            export_format: MigrationExportFormat::Tsv,
+            ..MigrationSpec::default()
+        };
+        let plan = build_migration_plan(&spec);
+
+        assert!(plan.source_sql.contains("FIELDS TERMINATED BY '\\t'"));
+        assert!(plan.target_sql.contains("FIELD_DELIMITER = '\\t'"));
     }
 
     #[test]
