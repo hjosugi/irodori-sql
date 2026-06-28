@@ -8,8 +8,32 @@ This crate contains the pieces that are useful outside the desktop app:
 - parameter detection and prompt modeling;
 - information-schema/metamodel query builders;
 - schema diff and migration-preview primitives.
+- cross-engine migration planning helpers for Hive, Snowflake, PostgreSQL,
+  MySQL/MariaDB, Oracle, DuckDB, Iceberg REST, and S3 Tables;
+- deterministic row-hash, fingerprint, manifest-table, and high-signal diff SQL
+  builders for validating large data moves.
 
 It intentionally has no dependency on the Irodori desktop shell.
+
+## Migration helpers
+
+The `migration` module does not open database connections or move data. It
+generates the runbook and SQL that an app can execute with its own credentials:
+
+```rust
+use irodori_sql::migration::{build_migration_plan, MigrationSpec};
+
+let spec = MigrationSpec::hive_to_snowflake("legacy.orders", "analytics.orders");
+let plan = build_migration_plan(&spec);
+
+println!("{}", plan.source_sql); // Hive Parquet export + row hash manifest
+println!("{}", plan.target_sql); // Snowflake stage/COPY + validation SQL
+println!("{}", plan.diff_sql);   // keyed row-hash diff
+```
+
+The generated validation flow is count -> key count -> hash fingerprint ->
+row-level diff, so callers can avoid expensive row-by-row inspection until a
+partition or batch fails the cheap gates.
 
 ## Development
 
