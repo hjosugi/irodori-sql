@@ -512,11 +512,7 @@ fn render_expr(out: &mut String, expr: &Expr, d: &dyn SqlDialect) {
         }
         Expr::IsNull { expr, negated } => {
             render_child(out, expr, 7, d);
-            out.push_str(if *negated {
-                " IS NOT NULL"
-            } else {
-                " IS NULL"
-            });
+            out.push_str(if *negated { " IS NOT NULL" } else { " IS NULL" });
         }
         Expr::Paren(inner) => {
             out.push('(');

@@ -112,7 +112,9 @@ pub fn select_grammar(schema: Option<&GrammarSchema>) -> String {
     out.push_str(SELECT_BODY.trim_start());
     out.push('\n');
 
-    let tables = schema.map(GrammarSchema::terminal_tables).unwrap_or_default();
+    let tables = schema
+        .map(GrammarSchema::terminal_tables)
+        .unwrap_or_default();
     let columns = schema
         .map(GrammarSchema::terminal_columns)
         .unwrap_or_default();

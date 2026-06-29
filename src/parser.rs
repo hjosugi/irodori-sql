@@ -546,9 +546,7 @@ impl<'a> Parser<'a> {
             return Ok(SelectItem::Wildcard);
         }
         // `alias.*`
-        if let (Some(t0), Some(t1), Some(t2)) =
-            (self.peek(), self.peek_at(1), self.peek_at(2))
-        {
+        if let (Some(t0), Some(t1), Some(t2)) = (self.peek(), self.peek_at(1), self.peek_at(2)) {
             if matches!(&t0.kind, TokKind::Word(_) | TokKind::Quoted(_))
                 && t1.kind == TokKind::Dot
                 && t2.kind == TokKind::Star
@@ -1001,9 +999,38 @@ fn binary(left: Expr, op: BinaryOp, right: Expr) -> Expr {
 /// Words that terminate an implicit alias / table-ref (clause + join keywords).
 fn is_reserved_boundary(word: &str) -> bool {
     const BOUNDARY: &[&str] = &[
-        "FROM", "WHERE", "GROUP", "ORDER", "BY", "HAVING", "LIMIT", "OFFSET", "JOIN", "INNER",
-        "LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "ON", "UNION", "EXCEPT", "INTERSECT", "AS",
-        "AND", "OR", "ASC", "DESC", "WHEN", "THEN", "ELSE", "END", "IS", "IN", "LIKE", "BETWEEN",
+        "FROM",
+        "WHERE",
+        "GROUP",
+        "ORDER",
+        "BY",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "JOIN",
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "CROSS",
+        "OUTER",
+        "ON",
+        "UNION",
+        "EXCEPT",
+        "INTERSECT",
+        "AS",
+        "AND",
+        "OR",
+        "ASC",
+        "DESC",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "END",
+        "IS",
+        "IN",
+        "LIKE",
+        "BETWEEN",
         "NOT",
     ];
     BOUNDARY.iter().any(|kw| kw.eq_ignore_ascii_case(word))
@@ -1040,8 +1067,7 @@ mod tests {
 
     #[test]
     fn parses_joins_with_on() {
-        let ast =
-            round_trip("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id");
+        let ast = round_trip("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id");
         assert_eq!(ast.joins.len(), 1);
         assert_eq!(ast.joins[0].kind, JoinKind::Inner);
     }
