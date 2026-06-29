@@ -5,6 +5,7 @@
 //! can prompt, bind, and remember values without guessing from raw text.
 
 use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterStyle {
@@ -109,25 +110,14 @@ pub struct BoundQuery {
     pub params: Vec<BoundParameter>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParameterBindingError {
+    #[error("missing value for parameter {placeholder} ({key:?})")]
     MissingValue {
         key: ParameterKey,
         placeholder: String,
     },
 }
-
-impl std::fmt::Display for ParameterBindingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingValue { key, placeholder } => {
-                write!(f, "missing value for parameter {placeholder} ({key:?})")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ParameterBindingError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParameterPrompt {
@@ -166,6 +156,7 @@ impl QueryParameterMemory {
     }
 }
 
+#[tracing::instrument(skip_all, fields(sql_bytes = sql.len()))]
 pub fn detect_parameters(sql: &str) -> Vec<QueryParameter> {
     let bytes = sql.as_bytes();
     let mut params = Vec::new();
@@ -239,9 +230,11 @@ pub fn detect_parameters(sql: &str) -> Vec<QueryParameter> {
         }
     }
 
+    tracing::debug!(parameter_count = params.len(), "detected SQL parameters");
     params
 }
 
+#[tracing::instrument(skip_all, fields(sql_bytes = sql.len(), supplied_values = !values.is_empty()))]
 pub fn bind_parameters(
     sql: &str,
     values: &ParameterValues,
@@ -262,6 +255,7 @@ pub fn bind_parameters(
         params.push(BoundParameter { parameter, value });
     }
 
+    tracing::debug!(parameter_count = params.len(), "bound SQL parameters");
     Ok(BoundQuery {
         sql: sql.to_string(),
         params,

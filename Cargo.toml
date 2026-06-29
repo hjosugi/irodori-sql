@@ -12,3 +12,15 @@ categories = ["database"]
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2.0.18"
+tracing = "0.1.44"
+
+[dev-dependencies]
+insta = "1.48.0"
+postgres = "0.19.14"
+testcontainers = { version = "0.27.3", features = ["blocking"] }
+testcontainers-modules = { version = "0.15.0", features = ["blocking", "postgres"] }
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }

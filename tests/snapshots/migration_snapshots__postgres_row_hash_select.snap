@@ -1,0 +1,14 @@
+---
+source: tests/migration_snapshots.rs
+expression: "row_hash_select_sql(MigrationEngine::Postgres, &spec.source_table,\n&spec.key_columns, &spec.compare_columns, &spec.partition_predicate, &spec,)"
+---
+-- Row hash manifest query.
+SELECT
+  order_id,
+  amount,
+  updated_at,
+  sales_dt AS irodori_partition,
+  LOWER(MD5(CONCAT_WS('|#|', COALESCE(LOWER(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g')), '__IRODORI_NULL__')))) AS irodori_key_hash,
+  LOWER(MD5(CONCAT_WS('|#|', COALESCE(LOWER(REGEXP_REPLACE(CAST(order_id AS TEXT), '\s+', ' ', 'g')), '__IRODORI_NULL__'), COALESCE(LOWER(REGEXP_REPLACE(CAST(amount AS TEXT), '\s+', ' ', 'g')), '__IRODORI_NULL__'), COALESCE(LOWER(REGEXP_REPLACE(CAST(updated_at AS TEXT), '\s+', ' ', 'g')), '__IRODORI_NULL__')))) AS irodori_row_hash
+FROM public.orders
+WHERE sales_dt >= '2026-01-01'

@@ -13,26 +13,21 @@
 
 use crate::ast::*;
 use crate::dialect::SqlDialect;
-use std::fmt;
+use thiserror::Error;
 
 /// A parse failure with a human-readable message and byte offset into the input.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message} (at byte {position})")]
 pub struct ParseError {
     pub message: String,
     pub position: usize,
 }
 
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} (at byte {})", self.message, self.position)
-    }
-}
-
-impl std::error::Error for ParseError {}
-
 /// Parse a single `SELECT` statement (an optional trailing `;` is allowed).
+#[tracing::instrument(skip_all, fields(sql_bytes = sql.len()))]
 pub fn parse_select(sql: &str, dialect: &dyn SqlDialect) -> Result<SelectStatement, ParseError> {
     let tokens = tokenize(sql, dialect)?;
+    let token_count = tokens.len();
     let mut parser = Parser {
         tokens,
         pos: 0,
@@ -46,6 +41,7 @@ pub fn parse_select(sql: &str, dialect: &dyn SqlDialect) -> Result<SelectStateme
             position: tok.position,
         });
     }
+    tracing::debug!(token_count, "parsed select statement");
     Ok(stmt)
 }
 

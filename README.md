@@ -60,6 +60,20 @@ println!("{}", diff.body); // ... '${1:hash_bucket}' ...
 cargo test
 ```
 
+Snapshot tests cover engine-specific migration SQL generation. Update them
+intentionally with:
+
+```sh
+INSTA_UPDATE=always cargo test --test migration_snapshots
+```
+
+Real-database integration tests use testcontainers and are ignored by default
+because they require Docker:
+
+```sh
+cargo test --test migration_real_db -- --ignored
+```
+
 Irodori Table consumes this crate as a version-tagged Git dependency so the app
 can stay slimmer while the SQL contract evolves independently.
 

@@ -1,0 +1,33 @@
+---
+source: tests/migration_snapshots.rs
+expression: "keyed_diff_sql(MigrationEngine::MySql, &spec.key_columns, spec.diff_limit)"
+---
+-- MySQL/MariaDB do not support native full joins; emulate them with two anti-joins.
+WITH source_rows AS (
+  SELECT * FROM irodori_source_manifest
+),
+target_rows AS (
+  SELECT * FROM irodori_target_manifest
+)
+SELECT
+  s.order_id AS order_id,
+  CASE WHEN t.irodori_row_hash IS NULL THEN 'source_only' ELSE 'changed' END AS diff_kind,
+  s.irodori_row_hash AS source_hash,
+  t.irodori_row_hash AS target_hash
+FROM source_rows s
+LEFT JOIN target_rows t
+  ON s.order_id = t.order_id
+WHERE t.irodori_row_hash IS NULL
+   OR s.irodori_row_hash <> t.irodori_row_hash
+UNION ALL
+SELECT
+  t.order_id AS order_id,
+  'target_only' AS diff_kind,
+  s.irodori_row_hash AS source_hash,
+  t.irodori_row_hash AS target_hash
+FROM target_rows t
+LEFT JOIN source_rows s
+  ON s.order_id = t.order_id
+WHERE s.irodori_row_hash IS NULL
+ORDER BY 1
+LIMIT 25

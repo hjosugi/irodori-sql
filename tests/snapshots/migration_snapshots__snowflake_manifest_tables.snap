@@ -1,0 +1,18 @@
+---
+source: tests/migration_snapshots.rs
+expression: "manifest_table_sql(MigrationEngine::Snowflake, &spec.key_columns,\n&spec.partition_column,)"
+---
+-- Manifest tables hold source and target row hashes for fast diff.
+CREATE OR REPLACE TEMP TABLE irodori_source_manifest (
+  order_id STRING,
+  irodori_key_hash STRING,
+  irodori_row_hash STRING,
+  irodori_partition STRING
+);
+
+CREATE OR REPLACE TEMP TABLE irodori_target_manifest (
+  order_id STRING,
+  irodori_key_hash STRING,
+  irodori_row_hash STRING,
+  irodori_partition STRING
+)

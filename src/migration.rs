@@ -228,6 +228,15 @@ pub fn parse_column_list(value: &str) -> Vec<String> {
     )
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(
+        source_engine = spec.source_engine.label(),
+        target_engine = spec.target_engine.label(),
+        source_table = %spec.source_table,
+        target_table = %spec.target_table
+    )
+)]
 pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
     let spec = spec.normalized();
     let source_label = spec.source_engine.label().to_string();
@@ -309,6 +318,14 @@ pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
     .collect::<Vec<_>>()
     .join(" ");
 
+    tracing::debug!(
+        key_count = keys.len(),
+        compare_column_count = compare_columns.len(),
+        hash_column_count = hash_columns.len(),
+        warning_count = warnings.len(),
+        "built migration plan"
+    );
+
     MigrationPlan {
         title: title.clone(),
         source_label,
@@ -326,6 +343,14 @@ pub fn build_migration_plan(spec: &MigrationSpec) -> MigrationPlan {
     }
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(
+        source_engine = spec.source_engine.label(),
+        target_engine = spec.target_engine.label(),
+        foreign_key_count = foreign_keys.len()
+    )
+)]
 pub fn build_migration_snippets(
     spec: &MigrationSpec,
     foreign_keys: &[ForeignKeySpec],
@@ -423,6 +448,7 @@ pub fn build_migration_snippets(
         ));
     }
 
+    tracing::debug!(snippet_count = snippets.len(), "built migration snippets");
     snippets
 }
 
