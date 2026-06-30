@@ -1,6 +1,6 @@
 [package]
 name = "irodori-sql"
-version = "0.2.24"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR 0BSD"
 authors = ["Irodori Table contributors"]
